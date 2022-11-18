@@ -1,0 +1,953 @@
+---
+title: "Polygenic risk scores predict hypertension"
+editor_options:
+  chunk_output_type: console
+output:
+  html_document:
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+
+
+**Libraries**
+
+
+```{r}
+setwd("/home/ivm/red/ht_prs")
+
+packrat::on()
+library(tidyverse)
+library(survival)   # survival analysis
+library(data.table) # fread() function
+library(gridExtra)  # plots to grid
+library(survminer)  # ggbased visualization and extra diagnostics
+library(survRM2)    # restricted mean survival times
+library(visdat)     # visualization of tibble and na's
+library(forestplot) # forestplot
+
+source('/finngen/red/ht_prs/articles-functions.R')
+```
+
+
+# Data
+
+**Risk scores**
+
+Calculated from UK Biobank (UKB) for Finngen Data Freeze 5 individuals using the PRS-CS18 pipeline with default parameters.
+
+
+**Endpoints**
+
+* I9_HYPTENS: Hypertension
+* I9_CVD_HARD: Hard cardiovascular diseases
+* I9_CHD: Major coronary heart disease event
+* I9_STR: Ischaemic Stroke, excluding all haemorrhages.
+
+
+**Copying and preprocessing data**
+Endpoint and covariate files transfered and unzipped. Columns selected from endpoint file prior to import to r, because the original phenotype file is very large.
+
+
+```{bash, eval=F}
+
+#Endpoint file and covariate file copied and unzipped
+
+cp /finngen/library-red/finngen_R5/phenotype_2.0/data/finngen_R5_V2_endpoint.gz /finngen/red/ht_prs/data/
+cp /finngen/library-red/finngen_R5/phenotype_2.0/data/R5_cov_pheno_1.0.txt.gz /finngen/red/ht_prs/data/  
+
+gzip -d /finngen/red/ht_prs/data/finngen_R5_V2_endpoint.gz
+gzip -d /finngen/red/ht_prs/data/R5_cov_pheno_1.0.txt.gz
+
+#Self written perl-script to extract columns from phenotype file
+perl select_columns.pl data/finngen_R5_V2_endpoint data/finngen_R5_V2_HTCVD FINNGENID I9_HYPTENS I9_HYPTENS_AGE I9_CVD_HARD I9_CVD_HARD_AGE I9_CHD I9_CHD_AGE I9_STR I9_STR_AGE FU_END_AGE
+
+#This could be loaded directly to R, but now loading will be faster...
+perl select_columns.pl data/R5_cov_pheno_1.0.txt data/R5_cov_pheno_selected FINNGENID batch BL_YEAR cohort SEX_IMPUTED PC1 PC2 PC3 PC4 PC5 PC6 PC7 PC8 PC9 PC10
+
+```
+
+
+**Loading data**
+
+```{r}
+
+endpoints <- fread("/finngen/red/ht_prs/data/finngen_R5_V2_HTCVD", sep = "\t") 
+
+sbp_prs <- fread("/finngen/red/ukb-bp-prs/ukb-sbp-both.profile") %>%
+  select(IID, SCORE) %>%
+  rename(SBP_SCORE=SCORE)
+
+dbp_prs <- fread("/finngen/red/ukb-bp-prs/ukb-dbp-both.profile") %>%
+  select(IID, SCORE) %>%
+  rename(DBP_SCORE=SCORE)
+
+covs <- fread("/finngen/red/ht_prs/data/R5_cov_pheno_selected")
+
+
+```
+
+
+**Combining data**
+
+
+```{r}
+df <- endpoints %>%
+  left_join(sbp_prs, by = c("FINNGENID" = "IID")) %>%
+  left_join(dbp_prs, by = c("FINNGENID" = "IID")) %>%
+  left_join(covs, by = c("FINNGENID" = "FINNGENID")) 
+ 
+#Removing cases without genetic information and some other preprocessing
+df <- df %>%
+  filter(!is.na(batch)) %>%  
+  mutate_at(c("batch","cohort"),as.factor) 
+
+dim(df)
+
+```
+
+
+**Properties of variables **
+
+
+```{r, R.options = list(width = 120) }
+
+df_tmp <- df %>% select(I9_HYPTENS_AGE, I9_HYPTENS, SBP_SCORE, DBP_SCORE)
+summary(df_tmp)
+
+df_tmp2 <- df %>% select(I9_CVD_HARD, I9_CVD_HARD_AGE, I9_CHD, I9_CHD_AGE, I9_STR, I9_STR_AGE)
+summary(df_tmp2)
+
+dim(df)
+
+#Summary information about sex and age at the end of followup
+df$SEX_IMPUTED %>%
+  mean()
+  
+summary(df$FU_END_AGE)
+sd(df$FU_END_AGE)
+
+
+```    
+
+
+<details><summary>**Visualisations on data**</summary>
+
+
+```{r, R.options = list(width = 120) }
+
+df_scores <- df %>% select(SBP_SCORE,DBP_SCORE)
+cor(df_scores, method = "pearson")
+
+par(mfrow=c(1,2))
+hist(df$SBP_SCORE)
+hist(df$DBP_SCORE)
+par(mfrow=c(1,1))
+
+#5000 random observations
+df %>% 
+  sample_n(5000) %>%
+  vis_dat()
+
+#Visualisation of endpoints
+
+endpoints <- c("I9_HYPTENS", "I9_CVD_HARD", "I9_CHD", "I9_STR")
+endpoints_age <- c("I9_HYPTENS_AGE","I9_CVD_HARD_AGE", "I9_CHD_AGE", "I9_STR_AGE")
+
+df_long_ep <-   df %>%
+  select("FINNGENID", all_of(endpoints)) %>%
+  pivot_longer(cols=endpoints, names_to = "endpoint",values_to = "status")
+
+df_long <-   df %>%
+  select("FINNGENID", all_of(endpoints_age)) %>%
+  pivot_longer(cols=endpoints_age, names_to = "endpoint",values_to = "age") %>%
+  mutate(endpoint = str_remove(endpoint,"_AGE")) %>%
+  left_join(df_long_ep, by=c("FINNGENID", "endpoint"))
+
+ggplot(df_long, aes(x=age, color=as.factor(status), fill=as.factor(status))) +
+    geom_histogram(alpha=0.4) +
+    theme(legend.title = element_blank()) +
+    facet_wrap(~endpoint, ncol=2)
+
+#PC:s
+
+df_long_pc <-   df %>%
+  select("FINNGENID", PC1:PC10) %>%
+  pivot_longer(cols=PC1:PC10, names_to = "PC", values_to = "value")
+
+ggplot(df_long_pc, aes(x=value)) +
+    geom_histogram() +
+    theme(legend.title = element_blank()) +
+    facet_wrap(~PC, ncol=4)
+
+
+#Other covariates
+df_tmp3 <- df %>% select(BL_YEAR, batch, cohort)
+summary(df_tmp3)
+
+```
+
+</details>
+<br>
+
+
+**Creating scaled variables**
+
+```{r}
+df <- df %>%
+  mutate(SBP_SCALED = scale(SBP_SCORE),
+         DBP_SCALED = scale(DBP_SCORE))
+```
+
+
+
+**Dividing to late and early hypertension**
+
+
+```{r}
+
+df <- df %>%  
+  mutate(HT_EARLY = case_when(I9_HYPTENS_AGE < 55 ~ I9_HYPTENS,
+                              is.na(I9_HYPTENS) ~ I9_HYPTENS,
+                              TRUE ~ as.integer(0)),
+         HT_LATE  = case_when(I9_HYPTENS_AGE >= 55 ~ I9_HYPTENS,
+                              is.na(I9_HYPTENS) ~ I9_HYPTENS,
+                              TRUE ~ as.integer(0)),
+         AGE_CAT  = if_else(I9_HYPTENS_AGE <  55, 1,2))
+
+```
+
+
+
+**Creating categorical variables**
+
+Data was categorized also in Mars *et al.*, Nat.Med. 26, 549-557, (2020). 
+
+
+```{r}
+
+#Let's add parametric versions of the scores
+my_probs = c(0,0.025,0.2,0.8,0.975,1)
+my_labels =  c("<2.5%","2.5-20%","20-80%","80-97.5%",">97.5%")
+
+df <- df %>%  
+  mutate(
+    SBP_CAT = cut(SBP_SCORE, breaks=quantile(df$SBP_SCORE, probs = my_probs), labels=my_labels, include.lowest = T),
+    DBP_CAT = cut(DBP_SCORE, breaks=quantile(df$DBP_SCORE, probs = my_probs), labels=my_labels, include.lowest = T)    
+  ) 
+
+#Let's create new dataframe for tables with 20-80% as reference. 
+
+df_r <- df %>%
+  mutate(
+    SBP_CAT = relevel(SBP_CAT, ref = "20-80%"),
+    DBP_CAT = relevel(DBP_CAT, ref = "20-80%")
+  )
+
+
+```
+
+
+
+# BP PRSs and hypertension
+
+
+## Proportional hazard assumption: log log curve
+
+
+**Model by survfit**
+
+
+```{r}
+
+#SBP
+km.sbp <- survfit(Surv(I9_HYPTENS_AGE, I9_HYPTENS) ~ SBP_CAT, data=df)
+#print(km.sbp)
+
+#DBP
+km.dbp <- survfit(Surv(I9_HYPTENS_AGE, I9_HYPTENS) ~ DBP_CAT, data=df)
+#print(km.dbp)
+
+
+```
+
+
+**log log curve**
+
+
+```{r, fig.width=10, fig.height=5}
+
+cols= c("skyblue", "blue", "black", "red", "salmon")
+labels= c("<2.5%","2.5-20%","20-80%","80-97.5%",">97.5%")
+
+par(mfrow=c(1,2))
+
+plot(km.sbp, fun="cloglog", xlim=c(20,100), main="SBP: log log", xlab="Age", col = cols)
+plot(km.dbp, fun="cloglog", xlim=c(20,100), main="DBP: log log", xlab="Age", col = cols)
+
+par(mfrow=c(1,1))
+
+```
+
+These look parallel enough. We can use cox model.
+
+
+## Cox model: covariate adjusted, continuous score
+
+
+
+**Running models**
+
+
+```{r}
+#Fitting cox for SBP_SCORE
+cx.sbp.cs <- coxph(Surv(I9_HYPTENS_AGE, I9_HYPTENS) ~ SBP_SCALED + SEX_IMPUTED + batch + BL_YEAR + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10, data=df)
+
+#Fitting cox for DBP_SCORE
+cx.dbp.cs <- coxph(Surv(I9_HYPTENS_AGE, I9_HYPTENS) ~ DBP_SCALED + SEX_IMPUTED + batch + BL_YEAR + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10, data=df)
+
+```
+
+
+**Table: Hazard rations:**
+
+
+```{r}
+
+my_hr_table_cont2(list(cx.sbp.cs, cx.dbp.cs), c("SBP", "DBP")) %>%
+  knitr::kable()
+
+```
+
+
+
+
+<details><summary>**All coefficients**</summary>
+
+
+```{r}
+
+summary(cx.sbp.cs)
+summary(cx.dbp.cs)
+
+```
+
+
+</details>
+<br>
+
+
+
+
+## Cox model: adjusted, continuous, by age
+
+
+
+```{r}
+#Young
+cx.sbp.cs.y <- coxph(Surv(I9_HYPTENS_AGE, HT_EARLY) ~ SBP_SCALED + SEX_IMPUTED + batch + BL_YEAR + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10, data=df)
+cx.dbp.cs.y <- coxph(Surv(I9_HYPTENS_AGE, HT_EARLY) ~ DBP_SCALED + SEX_IMPUTED + batch + BL_YEAR + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10, data=df)
+
+#Old
+cx.sbp.cs.o <- coxph(Surv(I9_HYPTENS_AGE, HT_LATE) ~ SBP_SCALED + SEX_IMPUTED + batch + BL_YEAR + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10, data=df)
+cx.dbp.cs.o <- coxph(Surv(I9_HYPTENS_AGE, HT_LATE) ~ DBP_SCALED + SEX_IMPUTED + batch + BL_YEAR + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10, data=df)
+
+```
+
+
+**Hazard ratios/early**
+
+
+```{r}
+
+my_hr_table_cont2(list(cx.sbp.cs.y, cx.dbp.cs.y), c("SBP", "DBP")) %>%
+  knitr::kable()
+
+
+```
+
+
+**Hazard ratios/late**
+
+```{r}
+
+my_hr_table_cont2(list(cx.sbp.cs.o, cx.dbp.cs.o), c("SBP", "DBP")) %>%
+  knitr::kable() 
+
+```
+
+
+
+## Cox model: covariate adjusted, categorized score
+
+
+
+**Running models**
+
+
+```{r}
+#Fitting cox for SBP_SCORE
+cx.sbp <- coxph(Surv(I9_HYPTENS_AGE, I9_HYPTENS) ~ SBP_CAT + SEX_IMPUTED + batch + BL_YEAR + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10, data=df_r)
+
+#Fitting cox for DBP_SCORE
+cx.dbp <- coxph(Surv(I9_HYPTENS_AGE, I9_HYPTENS) ~ DBP_CAT + SEX_IMPUTED + batch + BL_YEAR + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10, data=df_r)
+
+```
+
+
+**Table: Hazard ratios:**
+
+
+```{r}
+
+my_hr_table2(cx.sbp, cx.dbp) %>%
+  knitr::kable()
+
+```
+
+
+<details><summary>**All coefficients**</summary>
+
+
+```{r}
+
+summary(cx.sbp)
+summary(cx.dbp)
+
+
+```
+
+
+</details>
+<br>
+
+
+**Selecting covariates for plot**
+
+We used **mean** values for all numeric variables. For 'batch', we use the level with **lowest significance**.
+
+
+<details><summary>Choosing covariate values</summary>
+
+
+```{r, eval=F}
+
+sbp.coefs <-  summary(cx.sbp)$coefficients %>%
+  as.data.frame() %>%
+  mutate(name = row.names(.)) %>%
+  rename(pval="Pr(>|z|)") %>%
+  select("name", "coef", "exp(coef)","se(coef)", "pval")
+
+#Let's look bit more on batches to select a one for the figure
+batch.coefs <- sbp.coefs %>% 
+  arrange(pval) 
+
+batch.coefs  #Let's print out this
+  
+#Lowest significance is: AxiomGT1_b07_V2P2.calls
+
+```
+
+
+</details>
+<br>
+
+
+**Cox-plot adjusted**
+
+Creating covariate combinations for the plot.
+
+
+```{r}
+
+df.sbp <- my_expand(cx.sbp, "SBP_CAT", df, batch = "AxiomGT1_b06_V2P2.calls")
+df.dbp <- my_expand(cx.dpp, "DBP_CAT", df, batch = "AxiomGT1_b06_V2P2.calls")
+
+
+fit.sbp <- survfit(cx.sbp, newdata = df.sbp)
+fit.dbp <- survfit(cx.dbp, newdata = df.dbp)
+
+```
+
+And the plot:
+
+```{r, fig.width=10, fig.height=4}
+
+
+p1 <- my_ggcoxplot(fit.sbp, df.sbp, "SBP", legend="none", ylab="Cumulative hypertension rate") 
+p2 <- my_ggcoxplot(fit.dbp, df.dbp,  "DBP", legend="none", ylab="") 
+
+#Legends as separate figure.
+p.tmp <- my_ggcoxplot(fit.sbp, df.sbp, "SBP", legend="right") 
+lgnd <- get_legend(p.tmp)   
+   
+#All collected together
+splots <- grid.arrange(p1, p2, lgnd, nrow = 1, widths = c(3,3,1))
+
+ggsave(file = "cx_ht_prs.tiff", plot = splots, height = 3.6, width = 9, dpi = 600)
+#ggsave(file = "cx_ht_prs.pdf", plot = splots, height = 4, width = 10, dpi = 150)
+ggsave(file = "cx_ht_prs.eps", device = cairo_ps, plot = splots, height = 3.6, width = 9, dpi = 150)
+
+```
+
+
+
+## Early and late onset hypertension.
+
+
+**Running models**
+
+
+```{r}
+#Fitting cox for SBP_SCORE
+cx.sbp.y <- coxph(Surv(I9_HYPTENS_AGE, HT_EARLY) ~ SBP_CAT + batch + BL_YEAR + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10, data=df_r)
+cx.sbp.o <- coxph(Surv(I9_HYPTENS_AGE, HT_LATE)  ~ SBP_CAT + batch + BL_YEAR + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10, data=df_r)
+
+#Fitting cox for DBP_SCORE
+cx.dbp.y <- coxph(Surv(I9_HYPTENS_AGE, HT_EARLY) ~ DBP_CAT + batch + BL_YEAR + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10, data=df_r)
+cx.dbp.o <- coxph(Surv(I9_HYPTENS_AGE, HT_LATE)  ~ DBP_CAT + batch + BL_YEAR + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10, data=df_r)
+
+
+```
+
+
+**Table: Hazard ratios/early:**
+
+
+```{r}
+
+my_hr_table2(cx.sbp.y, cx.dbp.y, "HT_EARLY") %>%
+  knitr::kable()
+
+```
+
+**Table: Hazard ratios/late:**
+
+
+```{r}
+
+my_hr_table2(cx.sbp.o, cx.dbp.o, "HT_LATE") %>%
+  knitr::kable()
+
+```
+
+
+
+## Restricted mean survival times
+
+Pairwise statistics between reference risk (20-80% quantile) and each other quantile is are calculated. For this purpose we need separate dataframe for each statistic of interest. 
+
+
+**Creating dataframes for each cases:**
+ 
+
+```{r}
+
+q <- c("<2.5%", "2.5-20%", "80-97.5%", ">97.5%" )
+df.list.sbp  <-  lapply(q, my_extr_cats2, cat="SBP_CAT", df=df)
+df.list.dbp  <-  lapply(q, my_extr_cats2, cat="DBP_CAT", df=df)
+
+```
+
+
+**rmst2 is runned for all cases**
+
+Unadjusted analysis - with covariates R is slow and output of this package does not include mean ages for adjusted.
+
+```{r}
+
+rmst0.sbp <- lapply(df.list.sbp, function(x) rmst2(x$I9_HYPTENS_AGE, x$I9_HYPTENS, x$CAT, tau=95))
+rmst0.dbp <- lapply(df.list.dbp, function(x) rmst2(x$I9_HYPTENS_AGE, x$I9_HYPTENS, x$CAT, tau=95))
+
+```
+
+
+**Results are extracted for the table**
+
+
+```{r}
+
+#Results extracted and collected to table
+
+rmst.table <- 
+  my_rmst_coefs(rmst0.sbp) %>%
+  bind_rows(my_rmst_coefs(rmst0.dbp)) %>%
+  my_tidy_table("0", 1) %>%
+  add_row(q="SBP", est="", pval="", lower_mean=NA, upper_mean=NA, mean=NA,  .before = 1) %>%
+  add_row(q="", est="", pval="", lower_mean=NA, upper_mean=NA, mean=NA,  .before = 7) %>%
+  add_row(q="DBP", est="", pval="", lower_mean=NA, upper_mean=NA, mean=NA, .before = 8)
+
+
+#rmst.table divided to two and formatted for forestplot
+
+rmst.means <- rmst.table %>%
+  select(mean, lower_mean, upper_mean) %>%
+  rename(lower = lower_mean, upper=upper_mean) %>%
+  add_row(mean=NA, lower=NA, upper=NA, .before = 1)
+
+rmst.text <- rmst.table %>%
+ select(q, est, pval) %>%
+  mutate(pval = sub("e(-\\d+)", "%*%10^{\\1}", pval, perl=T)) %>%     #to create proper exponents...
+  add_row(q=NA, est="Difference, Years (95% CI)", pval="P-value", .before = 1)
+
+#To create proper exponents... I need actual values as 'expression' and other lines as 'character'.
+#list format is needed to accomodate different datatypes; parse can convert character unlike 'as.expression'
+pvals <- lapply(rmst.text$pval, function(x) {ifelse(grepl("10",x), parse(text = x), x)})
+rmst.text.list <- list(as.list(rmst.text$q), as.list(rmst.text$est), pvals)     
+```
+
+
+**Forestplot**
+
+
+```{r,fig.width=9, fig.height=5.5}
+
+setEPS()
+postscript(file = 'rmst_unadj.eps', width = 9, height = 4.5) 
+
+my_rmst_plot(rmst.text.list, rmst.means, xlab = "Age of hypertension onset",
+             clip=c(60,90), xticks = c(60, 65, 70, 75,  80, 85), zero=60)
+dev.off()
+
+my_rmst_plot(rmst.text.list, rmst.means, xlab = "Age of hypertension onset",
+             clip=c(60,90), xticks = c(60, 65, 70, 75,  80, 85), zero=60)
+
+```
+
+
+# BP PRSs and cardiovascular outcomes
+
+
+## Proportional hazard assumption: log log curve:
+
+
+**Model by survfit**
+
+
+```{r}
+
+#SBP
+km.sbp.cvd <- survfit(Surv(I9_CVD_HARD_AGE, I9_CVD_HARD) ~ SBP_CAT, data=df)
+#print(km.sbp.cvd)
+
+#DBP
+km.sbp.chd <- survfit(Surv(I9_CHD_AGE, I9_CHD) ~ SBP_CAT, data=df)
+#print(km.sbp.chd)
+
+#PP
+km.sbp.str <- survfit(Surv(I9_STR_AGE, I9_STR) ~ SBP_CAT, data=df)
+#print(km.sbp.str)
+
+
+```
+
+
+
+**log log curve:**
+
+
+```{r, fig.width=10, fig.height=8}
+
+cols= c("skyblue", "blue", "black", "red", "salmon")
+labels= c("<2.5%","2.5-20%","20-80%","80-97.5%",">97.5%")
+
+par(mfrow=c(2,2))
+
+plot(km.sbp.chd, fun="cloglog", xlim=c(40,100), main="SBP CHD: log log", xlab="Age", col = cols)
+plot(km.sbp.cvd, fun="cloglog", xlim=c(40,100), main="SBP CVD: log log", xlab="Age", col = cols)
+plot(km.sbp.str, fun="cloglog", xlim=c(40,100), main="SBP STR: log log", xlab="Age", col = cols)
+
+par(mfrow=c(1,1))
+
+```
+
+These look parallel enough. We can use cox model.
+
+
+## Cox model: covariate adjusted, continuous score
+
+
+**Running models**
+
+
+```{r}
+
+#Fitting cox for CVD
+cx.sbp.cvd.cs <- coxph(Surv(I9_CVD_HARD_AGE, I9_CVD_HARD) ~ SBP_SCALED + SEX_IMPUTED + batch + BL_YEAR + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10, data=df)
+
+#Fitting cox for CHD
+cx.sbp.chd.cs <- coxph(Surv(I9_CHD_AGE, I9_CHD) ~ SBP_SCALED + SEX_IMPUTED + batch + BL_YEAR + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10, data=df)
+
+#Fitting cox for STR
+cx.sbp.str.cs <- coxph(Surv(I9_STR_AGE, I9_STR) ~ SBP_SCALED + SEX_IMPUTED + batch + BL_YEAR + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10, data=df)
+
+```
+
+
+
+**Table: Hazard rations:**
+
+
+For adjusted cox-model.
+
+
+```{r}
+
+my_hr_table_cont2(list(cx.sbp.cvd.cs, cx.sbp.chd.cs, cx.sbp.str.cs), c("CVD", "CHD", "Stroke")) %>%
+  knitr::kable()
+
+```
+
+
+
+
+<br>
+
+<details><summary>**All coefficients**</summary>
+
+
+```{r}
+
+summary(cx.sbp.cvd.cs)
+summary(cx.sbp.chd.cs)
+summary(cx.sbp.str.cs)
+
+
+```
+
+
+</details>
+<br>
+
+
+
+## Cox model: covariate adjusted, categorized score
+
+
+**Running models**
+
+
+```{r}
+ 
+#Fitting cox for CVD_HARD vs. SBP_CAT
+cx.sbp.cvd <- coxph(Surv(I9_CVD_HARD_AGE, I9_CVD_HARD) ~ SBP_CAT + SEX_IMPUTED + batch + BL_YEAR + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10, data=df_r)
+
+#Fitting cox for CHD vs. SBP_CAT
+cx.sbp.chd <- coxph(Surv(I9_CHD_AGE, I9_CHD) ~ SBP_CAT + SEX_IMPUTED + batch + BL_YEAR + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10, data=df_r)
+
+#Fitting cox for STR vs. SBP_CAT
+cx.sbp.str <- coxph(Surv(I9_STR_AGE, I9_STR) ~ SBP_CAT + SEX_IMPUTED + batch + BL_YEAR + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10, data=df_r)
+
+```
+
+
+**Table: Hazard rations:**
+
+
+```{r}
+
+my_hr_table_cvd2(cx.sbp.cvd, cx.sbp.chd, cx.sbp.str, "SBP_CAT", df) %>%
+  knitr::kable()
+
+
+```
+
+
+
+<br>
+
+<details><summary>**All coefficients**</summary>
+
+
+```{r}
+
+summary(cx.sbp.cvd)
+summary(cx.sbp.chd)
+summary(cx.sbp.str)
+
+
+```
+
+
+</details>
+<br>
+
+
+**Selecting covariates for plot**
+
+We used **mean** values for all numeric variables. For 'batch', we use batch with **low significance** for all variables.
+
+
+<details><summary>Choosing covariate values</summary>
+
+
+```{r, eval=F}
+
+summary(cx.sbp.cvd)$coefficients %>%
+  as.data.frame() %>%
+  mutate(name = row.names(.)) %>%
+  rename(pval="Pr(>|z|)") %>%
+  select("name", "coef", "exp(coef)","se(coef)", "pval") %>%  
+  arrange(pval)
+
+summary(cx.sbp.chd)$coefficients %>%
+  as.data.frame() %>%
+  mutate(name = row.names(.)) %>%
+  rename(pval="Pr(>|z|)") %>%
+  select("name", "coef", "exp(coef)","se(coef)", "pval")%>%  
+  arrange(pval)
+
+summary(cx.sbp.str)$coefficients %>%
+  as.data.frame() %>%
+  mutate(name = row.names(.)) %>%
+  rename(pval="Pr(>|z|)") %>%
+  select("name", "coef", "exp(coef)","se(coef)", "pval")%>%  
+  arrange(pval)
+
+#Batch:  AxiomGT1_b36_V2.calls, low for all cases. 
+
+```
+
+
+</details>
+<br>
+
+
+
+**Cox-plot: covariate adjusted, categorized score**
+
+```{r}
+
+df.sbp.cvd <- my_expand(cx.sbp.cvd, "SBP_CAT", df, batch = "AxiomGT1_b36_V2.calls")
+df.sbp.chd <- my_expand(cx.sbp.chd, "SBP_CAT", df, batch = "AxiomGT1_b36_V2.calls")
+df.sbp.str <- my_expand(cx.sbp.str, "SBP_CAT", df, batch = "AxiomGT1_b36_V2.calls")
+
+fit.sbp.cvd <- survfit(cx.sbp.cvd, newdata = df.sbp.cvd)
+fit.sbp.chd <- survfit(cx.sbp.chd, newdata = df.sbp.chd)
+fit.sbp.str <- survfit(cx.sbp.str, newdata = df.sbp.str)
+
+```
+
+
+And the plot:
+
+
+```{r, fig.width=10, fig.height=4}
+
+
+p1 <- my_ggcoxplot(fit.sbp.cvd, df.sbp.cvd, "CVD", conf.int = T, ylim=c(0,0.5), legend="none", vjust=-8)
+p2 <- my_ggcoxplot(fit.sbp.chd, df.sbp.chd,  "CHD", conf.int = T, ylim=c(0,0.5), legend="none", vjust=-8, ylab="")
+p3 <- my_ggcoxplot(fit.sbp.str, df.sbp.str, "Stroke", conf.int = T, ylim=c(0,0.5), legend="none", vjust=-8, ylab="")
+
+#legends
+p.tmp <-  my_ggcoxplot(fit.sbp.cvd, df.sbp.cvd, "CVD", conf.int = T, ylim=c(0,0.5), legend="right") 
+lgnd <- get_legend(p.tmp)  
+
+splots <- grid.arrange(p1, p2, p3, lgnd, nrow = 1, widths = c(3,3,3,1))
+
+ggsave(file = "cx_cvd_prs.png", plot = splots, height = 3, width = 10, dpi = 150)
+#ggsave(file = "cx_cvd_prs.pdf", plot = splots, height = 3, width = 10, dpi = 150)
+ggsave(file = "cx_cvd_prs.eps", device = cairo_ps, plot = splots, height = 3, width = 10, dpi = 150)
+
+```
+
+
+
+# Restricted mean survival times
+
+
+Pairwise statistics between reference risk (20-80% quantile) and each other quantile is are calculated. For this purpose we need separate dataframe for each statistic of interest. 
+
+
+**Creating dataframes for each cases:**
+
+
+```{r}
+
+#Run with covariates stalled - only unadjusted analysis is shown.
+
+q <- c("<2.5%", "2.5-20%", "80-97.5%", ">97.5%" )
+df.list.cvd  <-  lapply(q, my_extr_cats2, endpoints=c("I9_CVD_HARD_AGE", "I9_CVD_HARD"), cat="SBP_CAT", df=df)
+df.list.chd  <-  lapply(q, my_extr_cats2, endpoints=c("I9_CHD_AGE", "I9_CHD"), cat="SBP_CAT", df=df)
+df.list.str  <-  lapply(q, my_extr_cats2, endpoints=c("I9_STR_AGE", "I9_STR"), cat="SBP_CAT", df=df)
+
+
+```
+
+
+**rmst2 is runned for all cases**
+
+Unadjusted analysis - with covariates R stalls. Propably too large dataset. [The new version of package faster]
+
+```{r}
+
+#Unadjusted, this works:
+
+rmst0.cvd <- lapply(df.list.cvd, function(x) rmst2(x$I9_CVD_HARD_AGE, x$I9_CVD_HARD, x$CAT, tau=95))
+rmst0.chd <- lapply(df.list.chd, function(x) rmst2(x$I9_CHD_AGE, x$I9_CHD, x$CAT, tau=95))
+rmst0.str  <- lapply(df.list.str, function(x) rmst2(x$I9_STR_AGE, x$I9_STR, x$CAT, tau=95))
+
+
+```
+
+
+**Results are extracted for the table**
+
+
+```{r}
+
+#Results extracted and collected to table
+
+rmst.table.cvd <- 
+  my_rmst_coefs(rmst0.cvd) %>%
+  bind_rows(my_rmst_coefs(rmst0.chd)) %>%
+  bind_rows(my_rmst_coefs(rmst0.str)) %>%
+  my_tidy_table("0", 1) %>%
+  add_row(q="CVD", est="", pval="", lower_mean=NA, upper_mean=NA, mean=NA,  .before = 1) %>%
+  add_row(q="",    est="", pval="", lower_mean=NA, upper_mean=NA, mean=NA,  .before = 7) %>%
+  add_row(q="CHD", est="", pval="", lower_mean=NA, upper_mean=NA, mean=NA,  .before = 8) %>%
+  add_row(q="",    est="", pval="", lower_mean=NA, upper_mean=NA, mean=NA,   .before = 14)%>%
+  add_row(q="Stroke", est="", pval="", lower_mean=NA, upper_mean=NA, mean=NA,   .before = 15)
+
+
+#rmst.table divided to two and formatted for forestplot
+
+rmst.means.cvd <- rmst.table.cvd %>%
+  select(mean, lower_mean, upper_mean) %>%
+  rename(lower = lower_mean, upper=upper_mean) %>%
+  add_row(mean=NA, lower=NA, upper=NA, .before = 1)
+
+rmst.text.cvd <- rmst.table.cvd %>%
+ select(q, est, pval) %>%
+  mutate(pval = sub("e(-\\d+)", "%*%10^{\\1}", pval, perl=T)) %>%     #to create proper exponents...
+  add_row(q=NA, est="Difference, Years (95% CI)", pval="P-value", .before = 1)
+
+#To create proper exponents... I need actual values as 'expression' and other lines as 'character'.
+#list format is needed to accomodate different datatypes; parse can convert character unlike 'as.expression'
+pvals <- lapply(rmst.text.cvd$pval, function(x) {ifelse(grepl("10",x), parse(text = x), x)})
+rmst.text.list.cvd <- list(as.list(rmst.text.cvd$q), as.list(rmst.text.cvd$est), pvals)     
+
+```
+
+
+**Forestplot**
+
+
+```{r,fig.width=9, fig.height=6}
+
+#Forestplot
+
+setEPS()
+postscript(file = 'rmst_cvd_unadj.eps', width = 9, height = 6) 
+
+my_rmst_plot(rmst.text.list.cvd, rmst.means.cvd, 
+             clip=c(78,91), xticks = c(80, 85, 90), zero=80)
+dev.off()
+
+my_rmst_plot(rmst.text.list.cvd, rmst.means.cvd, 
+             clip=c(78,91), xticks = c(80, 85, 90), zero=80)
+
+```
+
