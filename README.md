@@ -1,5 +1,5 @@
 # ht_prs
-R code for the publication: Polygenic Risk Scores Predict Hypertension Onset and Cardiovascular Risk
+R code for the publication: Vaura, Felix, et al. "Polygenic risk scores predict hypertension onset and cardiovascular risk." Hypertension 77.4 (2021): 1119-1127.
 https://doi.org/10.1161/hypertensionaha.120.16471
 
 * PRS values were calculuted for FinnGen individuals using PRS-CS pipeline with default settings: https://github.com/getian107/PRScs
