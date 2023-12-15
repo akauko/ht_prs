@@ -9,7 +9,8 @@ https://doi.org/10.1161/hypertensionaha.120.16471
 ```
 ht_prs
 ├── README.md                 		# Overview
-├── ht_prs_final.rmd          		# R markdown for the analysis with FinnGen data
+├── ht_prs_final.Rmd          		# R markdown for the analysis with FinnGen data
+├── ht_prs_final_1408.html     		# Documentation html generated from R markdown
 ├── articles-functions.R      		# Minor R functions for the main analysis
 ├── select_columns.pl         		# Perl script to select columns from tsv files by column name
 	
